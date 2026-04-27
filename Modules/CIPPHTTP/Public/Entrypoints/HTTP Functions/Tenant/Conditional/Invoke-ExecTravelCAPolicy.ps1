@@ -10,22 +10,43 @@ function Invoke-ExecTravelCAPolicy {
     $Headers = $Request.Headers
 
     try {
-        $TenantFilter   = $Request.Body.tenantFilter
-        $Users          = $Request.Body.Users
-        $StartDate      = $Request.Body.StartDate
-        $EndDate        = $Request.Body.EndDate
-        $BlockPolicies  = $Request.Body.BlockPolicies
+        $TenantFilter = $Request.Body.tenantFilter
+        $Users = $Request.Body.Users
+        $StartDate = $Request.Body.StartDate
+        $EndDate = $Request.Body.EndDate
+        $BlockPolicies = $Request.Body.BlockPolicies
         $NamedLocations = $Request.Body.NamedLocations
-        $CountryCodes   = $Request.Body.CountryCodes
+        $CountryCodes = $Request.Body.CountryCodes
         $IncludeTrusted = $Request.Body.IncludeTrusted
 
         # Build user lists
         $UserUPNs = $Users.addedFields.userPrincipalName
-        $UserIds  = $Users.value
+        $UserIds = $Users.value
+
+        # Resolve UPNs to object IDs for CA policy
+        $ResolvedUserIds = [System.Collections.Generic.List[string]]::new()
+        foreach ($UserId in $UserIds) {
+            if ($UserId -match '^[a-f0-9]{8}-([a-f0-9]{4}-){3}[a-f0-9]{12}$') {
+                $ResolvedUserIds.Add($UserId)
+            }
+            else {
+                try {
+                    $UserObj = New-GraphGetRequest `
+                        -uri "https://graph.microsoft.com/beta/users/$($UserId)?`$select=id,userPrincipalName" `
+                        -tenantid $TenantFilter -asApp $true
+                    $ResolvedUserIds.Add($UserObj.id)
+                    Write-Information "Resolved $UserId -> $($UserObj.id)"
+                }
+                catch {
+                    throw "Could not resolve user '$UserId' to an object ID: $($_.Exception.Message)"
+                }
+            }
+        }
+        $UserIds = $ResolvedUserIds
 
         # Build date strings for policy name
-        $StartStr   = [datetimeoffset]::FromUnixTimeSeconds($StartDate).ToString('yyyyMMdd')
-        $EndStr     = [datetimeoffset]::FromUnixTimeSeconds($EndDate).ToString('yyyyMMdd')
+        $StartStr = [datetimeoffset]::FromUnixTimeSeconds($StartDate).ToString('yyyyMMdd')
+        $EndStr = [datetimeoffset]::FromUnixTimeSeconds($EndDate).ToString('yyyyMMdd')
         $PolicyName = "CIPP_TravelPolicy_${StartStr}_${EndStr}"
 
         #region --- 1. Check/create CIPP_TravelingUsers group ---
@@ -36,7 +57,8 @@ function Invoke-ExecTravelCAPolicy {
         if ($ExistingGroups) {
             $TravelGroupId = $ExistingGroups[0].id
             Write-Information "Using existing CIPP_TravelingUsers group: $TravelGroupId"
-        } else {
+        }
+        else {
             Write-Information 'Creating CIPP_TravelingUsers group'
             $GroupObject = [PSCustomObject]@{
                 groupType       = 'generic'
@@ -50,7 +72,6 @@ function Invoke-ExecTravelCAPolicy {
             }
             $TravelGroupId = $NewGroup.GroupId
             Write-Information "Created CIPP_TravelingUsers group: $TravelGroupId"
-            # Wait for group to propagate before use
             Start-Sleep -Seconds 5
         }
         #endregion
@@ -79,7 +100,8 @@ function Invoke-ExecTravelCAPolicy {
                 Write-LogMessage -headers $Headers -API 'Invoke-ExecTravelCAPolicy' `
                     -message "Added CIPP_TravelingUsers exclusion to CA policy: $($CurrentPolicy.displayName)" `
                     -Sev 'Info' -tenant $TenantFilter
-            } else {
+            }
+            else {
                 Write-Information "CIPP_TravelingUsers already excluded from policy: $($CurrentPolicy.displayName)"
             }
         }
@@ -88,7 +110,6 @@ function Invoke-ExecTravelCAPolicy {
         #region --- 3. Build includeLocations for travel CA policy ---
         $IncludeLocationIds = [System.Collections.Generic.List[string]]::new()
 
-        # Add selected Named Locations from tenant
         foreach ($Loc in $NamedLocations) {
             $LocId = $Loc.value ?? $Loc
             if (-not [string]::IsNullOrWhiteSpace($LocId)) {
@@ -96,7 +117,6 @@ function Invoke-ExecTravelCAPolicy {
             }
         }
 
-        # Add all Trusted Locations if requested
         if ($IncludeTrusted) {
             $AllLocations = New-GraphGetRequest `
                 -uri 'https://graph.microsoft.com/beta/identity/conditionalAccess/namedLocations?$top=999' `
@@ -109,11 +129,10 @@ function Invoke-ExecTravelCAPolicy {
             }
         }
 
-        # Create a country-based Named Location if country codes were provided
         if ($CountryCodes -and $CountryCodes.Count -gt 0) {
             $CountryLocationName = "CIPP_Travel_${StartStr}_${EndStr}_Countries"
             $CountryLocationBody = @{
-                '@odata.type'                     = '#microsoft.graph.countriesAndRegionsDefinition'
+                '@odata.type'                     = '#microsoft.graph.countryNamedLocation'
                 displayName                       = $CountryLocationName
                 countriesAndRegions               = @($CountryCodes)
                 includeUnknownCountriesAndRegions = $false
@@ -122,12 +141,48 @@ function Invoke-ExecTravelCAPolicy {
             $NewLocation = New-GraphPOSTRequest `
                 -uri 'https://graph.microsoft.com/beta/identity/conditionalAccess/namedLocations' `
                 -tenantid $TenantFilter -type POST -body $CountryLocationBody -asApp $true
-            $IncludeLocationIds.Add($NewLocation.id)
+
             Write-LogMessage -headers $Headers -API 'Invoke-ExecTravelCAPolicy' `
                 -message "Created country Named Location: $CountryLocationName ($($CountryCodes -join ', '))" `
                 -Sev 'Info' -tenant $TenantFilter
-            # Wait for Named Location to propagate
-            Start-Sleep -Seconds 3
+
+            $retryCount = 0
+            $LocationVerified = $false
+            do {
+                Start-Sleep -Seconds 8
+                try {
+                    $VerifyLocation = New-GraphGetRequest `
+                        -uri "https://graph.microsoft.com/beta/identity/conditionalAccess/namedLocations/$($NewLocation.id)" `
+                        -tenantid $TenantFilter -asApp $true -ErrorAction Stop
+
+                    Write-Information "Attempt $($retryCount + 1) - GET returned: id=$($VerifyLocation.id) displayName=$($VerifyLocation.displayName)"
+
+                    if ($VerifyLocation.id -eq $NewLocation.id) {
+                        $AllLocs = New-GraphGetRequest `
+                            -uri 'https://graph.microsoft.com/beta/identity/conditionalAccess/namedLocations?$top=999' `
+                            -tenantid $TenantFilter -asApp $true
+                        $FoundInList = $AllLocs | Where-Object { $_.id -eq $NewLocation.id }
+
+                        if ($FoundInList) {
+                            $LocationVerified = $true
+                            Write-Information "Named Location verified in full list after $($retryCount + 1) attempts: $($VerifyLocation.id)"
+                        }
+                        else {
+                            Write-Information "Attempt $($retryCount + 1) - Location exists by ID but NOT yet in namedLocations list - waiting..."
+                        }
+                    }
+                }
+                catch {
+                    Write-Information "Attempt $($retryCount + 1) - Named Location $($NewLocation.id) not yet available: $($_.Exception.Message)"
+                }
+                $retryCount++
+            } while (-not $LocationVerified -and $retryCount -lt 10)
+
+            if (-not $LocationVerified) {
+                throw "Named Location '$CountryLocationName' was created but could not be verified after $($retryCount * 8) seconds. Please try again."
+            }
+
+            $IncludeLocationIds.Add($NewLocation.id)
         }
         #endregion
 
@@ -170,7 +225,7 @@ function Invoke-ExecTravelCAPolicy {
         # StartDate: Add users to CIPP_TravelingUsers group
         $AddMemberTask = [pscustomobject]@{
             TenantFilter  = $TenantFilter
-            Name          = "Travel Mode - Add to group: $PolicyName"
+            Name          = "Vacation Travel - Add to group: $PolicyName"
             Command       = @{ value = 'Add-CIPPGroupMember'; label = 'Add-CIPPGroupMember' }
             Parameters    = [pscustomobject]@{
                 GroupType = 'Security'
@@ -186,7 +241,7 @@ function Invoke-ExecTravelCAPolicy {
         # EndDate: Remove users from CIPP_TravelingUsers group
         $RemoveMemberTask = [pscustomobject]@{
             TenantFilter  = $TenantFilter
-            Name          = "Travel Mode - Remove from group: $PolicyName"
+            Name          = "Vacation Travel - Remove from group: $PolicyName"
             Command       = @{ value = 'Remove-CIPPGroupMember'; label = 'Remove-CIPPGroupMember' }
             Parameters    = [pscustomobject]@{
                 GroupType = 'Security'
@@ -202,7 +257,7 @@ function Invoke-ExecTravelCAPolicy {
         # EndDate: Delete travel CA policy and country Named Location
         $DeletePolicyTask = [pscustomobject]@{
             TenantFilter  = $TenantFilter
-            Name          = "Travel Mode - Delete policy: $PolicyName"
+            Name          = "Vacation Travel - Delete policy: $PolicyName"
             Command       = @{ value = 'Remove-CIPPTravelCAPolicy'; label = 'Remove-CIPPTravelCAPolicy' }
             Parameters    = [pscustomobject]@{
                 TenantFilter = $TenantFilter
@@ -219,7 +274,8 @@ function Invoke-ExecTravelCAPolicy {
             Results = "Successfully scheduled travel mode for $($UserUPNs -join ', '). Policy '$PolicyName' will be active from $(([datetimeoffset]::FromUnixTimeSeconds($StartDate)).ToString('dd.MM.yyyy')) to $(([datetimeoffset]::FromUnixTimeSeconds($EndDate)).ToString('dd.MM.yyyy'))."
         }
 
-    } catch {
+    }
+    catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -headers $Headers -API 'Invoke-ExecTravelCAPolicy' `
             -message "Failed to set up travel mode: $($ErrorMessage.NormalizedError)" `
@@ -228,7 +284,7 @@ function Invoke-ExecTravelCAPolicy {
     }
 
     return ([HttpResponseContext]@{
-        StatusCode = [HttpStatusCode]::OK
-        Body       = $body
-    })
+            StatusCode = [HttpStatusCode]::OK
+            Body       = $body
+        })
 }
